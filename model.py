@@ -1,7 +1,10 @@
 import tensorflow as tf
-from tensorflow.contrib import rnn
-from utils import get_init_embedding
-
+from tensorflow.keras.layers import Dense, Embedding, LSTM, Dropout
+from tensorflow.keras.models import Model as KerasModel
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.losses import SparseCategoricalCrossentropy
+from tensorflow.keras.preprocessing.sequence import pad_sequences
+from tensorflow.compat.v1.nn.rnn_cell import LSTMStateTuple
 
 class Model(object):
     def __init__(self, reversed_dict, article_max_len, summary_max_len, args, forward_only=False):
@@ -15,40 +18,40 @@ class Model(object):
             self.keep_prob = args.keep_prob
         else:
             self.keep_prob = 1.0
-        self.cell = tf.nn.rnn_cell.BasicLSTMCell
-        with tf.variable_scope("decoder/projection"):
-            self.projection_layer = tf.layers.Dense(self.vocabulary_size, use_bias=False)
+        self.cell = LSTM
+        with tf.name_scope("decoder/projection"):
+            self.projection_layer = Dense(self.vocabulary_size, use_bias=False)
 
-        self.batch_size = tf.placeholder(tf.int32, (), name="batch_size")
-        self.X = tf.placeholder(tf.int32, [None, article_max_len])
-        self.X_len = tf.placeholder(tf.int32, [None])
-        self.decoder_input = tf.placeholder(tf.int32, [None, summary_max_len])
-        self.decoder_len = tf.placeholder(tf.int32, [None])
-        self.decoder_target = tf.placeholder(tf.int32, [None, summary_max_len])
+        self.batch_size = tf.Variable(0, trainable=False, dtype=tf.int32)
+        self.X = tf.Variable(tf.zeros([None, article_max_len], dtype=tf.int32))
+        self.X_len = tf.Variable(tf.zeros([None], dtype=tf.int32))
+        self.decoder_input = tf.Variable(tf.zeros([None, summary_max_len], dtype=tf.int32))
+        self.decoder_len = tf.Variable(tf.zeros([None], dtype=tf.int32))
+        self.decoder_target = tf.Variable(tf.zeros([None, summary_max_len], dtype=tf.int32))
         self.global_step = tf.Variable(0, trainable=False)
 
         with tf.name_scope("embedding"):
             if not forward_only and args.glove:
                 init_embeddings = tf.constant(get_init_embedding(reversed_dict, self.embedding_size), dtype=tf.float32)
             else:
-                init_embeddings = tf.random_uniform([self.vocabulary_size, self.embedding_size], -1.0, 1.0)
-            self.embeddings = tf.get_variable("embeddings", initializer=init_embeddings)
-            self.encoder_emb_inp = tf.transpose(tf.nn.embedding_lookup(self.embeddings, self.X), perm=[1, 0, 2])
-            self.decoder_emb_inp = tf.transpose(tf.nn.embedding_lookup(self.embeddings, self.decoder_input), perm=[1, 0, 2])
+                init_embeddings = tf.random.uniform([self.vocabulary_size, self.embedding_size], -1.0, 1.0)
+            self.embeddings = Embedding(self.vocabulary_size, self.embedding_size, embeddings_initializer=tf.constant_initializer(init_embeddings))
+            self.encoder_emb_inp = tf.transpose(self.embeddings(self.X), perm=[1, 0, 2])
+            self.decoder_emb_inp = tf.transpose(self.embeddings(self.decoder_input), perm=[1, 0, 2])
 
         with tf.name_scope("encoder"):
             fw_cells = [self.cell(self.num_hidden) for _ in range(self.num_layers)]
             bw_cells = [self.cell(self.num_hidden) for _ in range(self.num_layers)]
-            fw_cells = [rnn.DropoutWrapper(cell) for cell in fw_cells]
-            bw_cells = [rnn.DropoutWrapper(cell) for cell in bw_cells]
+            fw_cells = [Dropout(self.keep_prob)(cell) for cell in fw_cells]
+            bw_cells = [Dropout(self.keep_prob)(cell) for cell in bw_cells]
 
-            encoder_outputs, encoder_state_fw, encoder_state_bw = tf.contrib.rnn.stack_bidirectional_dynamic_rnn(
-                fw_cells, bw_cells, self.encoder_emb_inp,
-                sequence_length=self.X_len, time_major=True, dtype=tf.float32)
-            self.encoder_output = tf.concat(encoder_outputs, 2)
-            encoder_state_c = tf.concat((encoder_state_fw[0].c, encoder_state_bw[0].c), 1)
-            encoder_state_h = tf.concat((encoder_state_fw[0].h, encoder_state_bw[0].h), 1)
-            self.encoder_state = rnn.LSTMStateTuple(c=encoder_state_c, h=encoder_state_h)
+            encoder_outputs, state_fw, state_bw = tf.keras.layers.Bidirectional(self.cell(self.num_hidden, return_sequences=True, return_state=True),
+                                                                                backward_layer=self.cell(self.num_hidden, return_sequences=True, return_state=True),
+                                                                                input_shape=(None, self.embedding_size))(self.encoder_emb_inp)
+            self.encoder_output = tf.concat(encoder_outputs, axis=-1)
+            encoder_state_c = tf.concat((state_fw[0], state_bw[0]), axis=-1)
+            encoder_state_h = tf.concat((state_fw[1], state_bw[1]), axis=-1)
+            self.encoder_state = LSTMStateTuple(c=encoder_state_c, h=encoder_state_h)
 
         with tf.name_scope("decoder"), tf.variable_scope("decoder") as decoder_scope:
             decoder_cell = self.cell(self.num_hidden * 2)
@@ -95,13 +98,13 @@ class Model(object):
 
         with tf.name_scope("loss"):
             if not forward_only:
-                crossent = tf.nn.sparse_softmax_cross_entropy_with_logits(
-                    logits=self.logits_reshape, labels=self.decoder_target)
+                crossent = SparseCategoricalCrossentropy(from_logits=True)(
+                    y_true=self.decoder_target, y_pred=self.logits_reshape)
                 weights = tf.sequence_mask(self.decoder_len, summary_max_len, dtype=tf.float32)
-                self.loss = tf.reduce_sum(crossent * weights / tf.to_float(self.batch_size))
+                self.loss = tf.reduce_sum(crossent * weights / tf.cast(self.batch_size, dtype=tf.float32))
 
                 params = tf.trainable_variables()
                 gradients = tf.gradients(self.loss, params)
                 clipped_gradients, _ = tf.clip_by_global_norm(gradients, 5.0)
-                optimizer = tf.train.AdamOptimizer(self.learning_rate)
+                optimizer = Adam(self.learning_rate)
                 self.update = optimizer.apply_gradients(zip(clipped_gradients, params), global_step=self.global_step)
